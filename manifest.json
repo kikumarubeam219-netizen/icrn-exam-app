@@ -1,0 +1,17 @@
+{
+  "name": "集中治療認証看護師 過去問演習",
+  "short_name": "集中認証過去問",
+  "description": "集中治療認証看護師試験の過去問題（2022〜2025年度）演習・復習アプリ",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0284c7",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
