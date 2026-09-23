@@ -158,6 +158,20 @@ function initFirebase() {
       db = firebase.firestore();
       isFirebaseConfigured = true;
 
+      // セッションをローカルストレージに永続化（モバイルでのセッション切れ防止）
+      auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(err => {
+        console.warn('Persistence error:', err);
+      });
+
+      // リダイレクト結果の受信（モバイル用）
+      auth.getRedirectResult().then(result => {
+        if (result && result.user) {
+          console.log('Redirect login success:', result.user.email);
+        }
+      }).catch(err => {
+        console.warn('Redirect result error:', err);
+      });
+
       auth.onAuthStateChanged(handleAuthStateChange);
     } catch (e) {
       console.error('Firebase init error:', e);
@@ -338,12 +352,23 @@ async function handleGoogleLogin() {
     return;
   }
   const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
   try {
+    // まずはポップアップ認証を試みる
     await auth.signInWithPopup(provider);
   } catch (error) {
-    console.error('Google Sign-in error:', error);
-    if (error.code !== 'auth/popup-closed-by-user') {
-      alert(`ログインに失敗しました: ${error.message}`);
+    console.warn('Popup login failed, attempting redirect:', error);
+    // ポップアップがブロックされた場合やモバイル環境ではリダイレクトにフォールバック
+    if (error.code === 'auth/popup-blocked' || error.code === 'auth/cancelled-popup-request') {
+      try {
+        await auth.signInWithRedirect(provider);
+      } catch (redirectErr) {
+        console.error('Redirect sign-in error:', redirectErr);
+        alert(`ログインに失敗しました: ${redirectErr.message}`);
+      }
+    } else if (error.code !== 'auth/popup-closed-by-user') {
+      alert(`ログインエラー: ${error.message}\n\n※Firebaseコンソールの「承認済みドメイン」に kikumarubeam219-netizen.github.io が追加されているかご確認ください。`);
     }
   }
 }
