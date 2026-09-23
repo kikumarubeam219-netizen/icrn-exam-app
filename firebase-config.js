@@ -3,12 +3,12 @@
 // プロジェクトの「ウェブアプリ」の設定値（firebaseConfig）をここに貼り付けてください。
 
 const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.appspot.com",
-  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyApcS_vSQhcIGhqWTM-R2WLOzWG0K7nYsY",
+  authDomain: "icrn-exam-app.firebaseapp.com",
+  projectId: "icrn-exam-app",
+  storageBucket: "icrn-exam-app.firebasestorage.app",
+  messagingSenderId: "378716516166",
+  appId: "1:378716516166:web:063aa08febb057ee7ebf47"
 };
 
 // あなた（管理者）のGoogleメールアドレス
