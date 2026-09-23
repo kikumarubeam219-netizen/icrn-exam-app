@@ -1,11 +1,23 @@
 /**
  * 集中治療認証看護師 過去問演習アプリ コアスクリプト
+ * ・Googleログイン認証（Firebase Auth）
+ * ・管理者承認制（ホワイトリスト方式）
+ * ・個人別クラウドデータ同期（Cloud Firestore）
+ * ・年度別演習 / ランダム出題 / 弱点復習機能
  */
 
 // グローバル状態
 let allQuestions = [];
 let userAnswers = {}; // { qId: { selectedKeys: [], isCorrect: bool, timestamp: number } }
 let bookmarkedIds = new Set(); // Set of qId
+
+let currentUser = null; // Firebase User
+let isAdmin = false;
+let isApproved = false;
+let isFirebaseConfigured = false;
+
+let db = null;
+let auth = null;
 
 let currentSession = {
   mode: '', // 'year', 'random', 'wrong', 'bookmark'
@@ -14,7 +26,7 @@ let currentSession = {
   currentIndex: 0,
   userSelections: [],
   isAnswered: false,
-  sessionResults: [] // { qId, isCorrect }
+  sessionResults: []
 };
 
 // LocalStorageキー
@@ -22,12 +34,37 @@ const STORAGE_KEY_ANSWERS = 'icrn_user_answers_v1';
 const STORAGE_KEY_BOOKMARKS = 'icrn_bookmarks_v1';
 const STORAGE_KEY_THEME = 'icrn_theme_v1';
 
-// DOM要素の参照
+// DOM要素
 const dom = {
   // Views
+  viewAuth: document.getElementById('view-auth'),
+  viewPending: document.getElementById('view-pending'),
   viewHome: document.getElementById('view-home'),
   viewQuiz: document.getElementById('view-quiz'),
   viewResult: document.getElementById('view-result'),
+
+  // Auth / User UI
+  btnGoogleLogin: document.getElementById('btn-google-login'),
+  authConfigNotice: document.getElementById('auth-config-notice'),
+  btnBypassLogin: document.getElementById('btn-bypass-login'),
+  pendingUserEmail: document.getElementById('pending-user-email'),
+  btnPendingRefresh: document.getElementById('btn-pending-refresh'),
+  btnPendingLogout: document.getElementById('btn-pending-logout'),
+  userProfileMenu: document.getElementById('user-profile-menu'),
+  userAvatar: document.getElementById('user-avatar'),
+  btnLogout: document.getElementById('btn-logout'),
+  btnAdminPanel: document.getElementById('btn-admin-panel'),
+  cloudSyncBadge: document.getElementById('cloud-sync-badge'),
+
+  // Admin Modal
+  modalAdminUsers: document.getElementById('modal-admin-users'),
+  btnCloseAdminModal: document.getElementById('btn-close-admin-modal'),
+  inputNewWhitelistEmail: document.getElementById('input-new-whitelist-email'),
+  btnAddWhitelist: document.getElementById('btn-add-whitelist'),
+  adminPendingCount: document.getElementById('admin-pending-count'),
+  adminPendingList: document.getElementById('admin-pending-list'),
+  adminWhitelistCount: document.getElementById('admin-whitelist-count'),
+  adminWhitelistList: document.getElementById('admin-whitelist-list'),
 
   // Header
   btnHome: document.getElementById('btn-header-home'),
@@ -103,54 +140,357 @@ const dom = {
   btnCloseImageViewer: document.getElementById('btn-close-image-viewer')
 };
 
-// 初期化処理
+// ==================== 初期化 ====================
 async function init() {
-  loadStoredData();
   setupTheme();
   setupEventListeners();
   await loadQuestionsData();
+
+  // Firebaseのセットアップ
+  initFirebase();
+}
+
+function initFirebase() {
+  if (typeof firebase !== 'undefined' && typeof firebaseConfig !== 'undefined' && firebaseConfig.apiKey && firebaseConfig.apiKey !== 'YOUR_API_KEY') {
+    try {
+      firebase.initializeApp(firebaseConfig);
+      auth = firebase.auth();
+      db = firebase.firestore();
+      isFirebaseConfigured = true;
+
+      auth.onAuthStateChanged(handleAuthStateChange);
+    } catch (e) {
+      console.error('Firebase init error:', e);
+      fallbackToLocalMode('Firebase初期化エラー');
+    }
+  } else {
+    // Firebase設定が未入力の場合のフォールバック
+    isFirebaseConfigured = false;
+    dom.authConfigNotice.classList.remove('hidden');
+    switchView('auth');
+  }
+}
+
+function fallbackToLocalMode(reason) {
+  console.log('Running in local/offline mode:', reason);
+  isApproved = true;
+  currentUser = null;
+  loadStoredDataLocal();
+  switchView('home');
+  dom.cloudSyncBadge.innerHTML = '<i class="ph-bold ph-hard-drive"></i> ローカル保存';
+  dom.cloudSyncBadge.className = 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-500/30 text-slate-200 border border-slate-300/30';
   updateDashboardStats();
   renderOverviewGrid(2025);
 }
 
-// データのロード
-async function loadQuestionsData() {
-  try {
-    const res = await fetch('./data/questions.json');
-    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-    allQuestions = await res.json();
-    console.log(`Loaded ${allQuestions.length} questions successfully.`);
-  } catch (err) {
-    console.error('Failed to load questions:', err);
-    alert('問題データの読み込みに失敗しました。ページを再読み込みしてください。');
+// 認証ステータスの変化を監視
+async function handleAuthStateChange(user) {
+  if (!user) {
+    currentUser = null;
+    isAdmin = false;
+    isApproved = false;
+    dom.userProfileMenu.classList.add('hidden');
+    dom.userProfileMenu.classList.remove('flex');
+    dom.btnAdminPanel.classList.add('hidden');
+    switchView('auth');
+    return;
+  }
+
+  currentUser = user;
+  const userEmail = (user.email || '').toLowerCase().trim();
+  const adminEmail = (typeof ADMIN_EMAIL !== 'undefined' ? ADMIN_EMAIL : '').toLowerCase().trim();
+
+  // ユーザーアバター・メニューの表示
+  dom.userAvatar.src = user.photoURL || 'icon.svg';
+  dom.userAvatar.title = `${user.displayName || ''} (${user.email})`;
+  dom.userProfileMenu.classList.remove('hidden');
+  dom.userProfileMenu.classList.add('flex');
+
+  // 管理者判定
+  if (userEmail && adminEmail && userEmail === adminEmail) {
+    isAdmin = true;
+    isApproved = true;
+    dom.btnAdminPanel.classList.remove('hidden');
+  } else {
+    isAdmin = false;
+    dom.btnAdminPanel.classList.add('hidden');
+    // ホワイトリストのチェック
+    isApproved = await checkWhitelist(userEmail);
+  }
+
+  if (isApproved) {
+    // 承認済み: ユーザーデータをクラウドから読み込み
+    await loadUserDataFromCloud(user.uid);
+    switchView('home');
+    updateDashboardStats();
+    renderOverviewGrid(2025);
+  } else {
+    // 未承認: 承認申請を送信し、待機画面を表示
+    await submitJoinRequest(user);
+    dom.pendingUserEmail.textContent = user.email;
+    switchView('pending');
   }
 }
 
-// ストレージから履歴読み込み
-function loadStoredData() {
+// ホワイトリストのチェック
+async function checkWhitelist(email) {
+  if (!db || !email) return false;
+  try {
+    const docRef = db.collection('whitelist').doc(email);
+    const snap = await docRef.get();
+    return snap.exists && snap.data().allowed === true;
+  } catch (err) {
+    console.warn('Whitelist check error:', err);
+    return false;
+  }
+}
+
+// 承認リクエストの送信
+async function submitJoinRequest(user) {
+  if (!db) return;
+  try {
+    const email = (user.email || '').toLowerCase().trim();
+    await db.collection('join_requests').doc(email).set({
+      email: email,
+      displayName: user.displayName || '',
+      photoURL: user.photoURL || '',
+      requestedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.warn('Submit request error:', e);
+  }
+}
+
+// クラウド（Firestore）からのユーザーデータ取得
+async function loadUserDataFromCloud(uid) {
+  if (!db) {
+    loadStoredDataLocal();
+    return;
+  }
+
+  try {
+    const userDocRef = db.collection('users').doc(uid);
+    const snap = await userDocRef.get();
+
+    if (snap.exists) {
+      const data = snap.data();
+      userAnswers = data.answers || {};
+      bookmarkedIds = new Set(data.bookmarks || []);
+      console.log('User data loaded from Firestore cloud.');
+    } else {
+      // クラウドにまだない場合、LocalStorageにあれば移行
+      loadStoredDataLocal();
+      await saveUserDataToCloud();
+    }
+  } catch (err) {
+    console.warn('Firestore load failed, falling back to LocalStorage:', err);
+    loadStoredDataLocal();
+  }
+}
+
+// クラウド（Firestore）へのユーザーデータ保存
+async function saveUserDataToCloud() {
+  if (!currentUser || !db) return;
+  try {
+    const userDocRef = db.collection('users').doc(currentUser.uid);
+    await userDocRef.set({
+      email: currentUser.email,
+      displayName: currentUser.displayName || '',
+      answers: userAnswers,
+      bookmarks: Array.from(bookmarkedIds),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) {
+    console.warn('Firestore save error:', err);
+  }
+}
+
+// ユーザーデータの保存（クラウド＋ローカル併用）
+function saveUserData() {
+  // ローカルにもバックアップ保存
+  try {
+    localStorage.setItem(STORAGE_KEY_ANSWERS, JSON.stringify(userAnswers));
+    localStorage.setItem(STORAGE_KEY_BOOKMARKS, JSON.stringify(Array.from(bookmarkedIds)));
+  } catch (e) {}
+
+  // クラウドへ保存
+  if (isApproved && currentUser && isFirebaseConfigured) {
+    saveUserDataToCloud();
+  }
+
+  updateDashboardStats();
+}
+
+function loadStoredDataLocal() {
   try {
     const savedAns = localStorage.getItem(STORAGE_KEY_ANSWERS);
     if (savedAns) userAnswers = JSON.parse(savedAns);
 
     const savedBm = localStorage.getItem(STORAGE_KEY_BOOKMARKS);
     if (savedBm) bookmarkedIds = new Set(JSON.parse(savedBm));
-  } catch (e) {
-    console.warn('LocalStorage access error:', e);
-  }
+  } catch (e) {}
 }
 
-// ストレージへ保存
-function saveUserData() {
+// Googleログイン処理
+async function handleGoogleLogin() {
+  if (!auth) {
+    alert('Firebase設定が完了していません。firebase-config.js をご確認ください。');
+    return;
+  }
+  const provider = new firebase.auth.GoogleAuthProvider();
   try {
-    localStorage.setItem(STORAGE_KEY_ANSWERS, JSON.stringify(userAnswers));
-    localStorage.setItem(STORAGE_KEY_BOOKMARKS, JSON.stringify(Array.from(bookmarkedIds)));
-  } catch (e) {
-    console.warn('LocalStorage save error:', e);
+    await auth.signInWithPopup(provider);
+  } catch (error) {
+    console.error('Google Sign-in error:', error);
+    if (error.code !== 'auth/popup-closed-by-user') {
+      alert(`ログインに失敗しました: ${error.message}`);
+    }
   }
-  updateDashboardStats();
 }
 
-// テーマ（ダークモード）設定
+// ログアウト処理
+async function handleLogout() {
+  if (auth) {
+    await auth.signOut();
+  }
+  userAnswers = {};
+  bookmarkedIds = new Set();
+  switchView('auth');
+}
+
+// ==================== 管理者用パネル機能 ====================
+
+async function openAdminPanel() {
+  if (!isAdmin || !db) return;
+  dom.modalAdminUsers.classList.remove('hidden');
+  await refreshAdminData();
+}
+
+function closeAdminPanel() {
+  dom.modalAdminUsers.classList.add('hidden');
+}
+
+async function refreshAdminData() {
+  if (!db) return;
+
+  // 1. 承認待ちリストの取得
+  try {
+    const reqSnap = await db.collection('join_requests').orderBy('requestedAt', 'desc').get();
+    dom.adminPendingCount.textContent = `${reqSnap.size}件`;
+    dom.adminPendingList.innerHTML = '';
+
+    if (reqSnap.empty) {
+      dom.adminPendingList.innerHTML = '<div class="text-xs text-slate-400 py-2 text-center">承認待ちの申請はありません</div>';
+    } else {
+      reqSnap.forEach(doc => {
+        const item = doc.data();
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2 rounded-lg bg-amber-50/60 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60';
+        row.innerHTML = `
+          <div>
+            <div class="font-bold text-slate-800 dark:text-slate-200 text-xs">${item.displayName || '（名前未設定）'}</div>
+            <div class="text-[11px] text-slate-500">${item.email}</div>
+          </div>
+          <button class="btn-approve-req px-3 py-1 text-xs font-bold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white transition shadow-sm">
+            承認して許可
+          </button>
+        `;
+        row.querySelector('.btn-approve-req').addEventListener('click', async () => {
+          await approveUser(item.email);
+          await refreshAdminData();
+        });
+        dom.adminPendingList.appendChild(row);
+      });
+    }
+  } catch (err) {
+    console.warn('Error fetching join requests:', err);
+  }
+
+  // 2. 許可済みホワイトリストの取得
+  try {
+    const whiteSnap = await db.collection('whitelist').where('allowed', '==', true).get();
+    dom.adminWhitelistCount.textContent = `${whiteSnap.size}名`;
+    dom.adminWhitelistList.innerHTML = '';
+
+    if (whiteSnap.empty) {
+      dom.adminWhitelistList.innerHTML = '<div class="text-xs text-slate-400 py-2 text-center">許可ユーザーはいません</div>';
+    } else {
+      whiteSnap.forEach(doc => {
+        const email = doc.id;
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700';
+        row.innerHTML = `
+          <span class="font-medium text-xs text-slate-700 dark:text-slate-300">${email}</span>
+          <button class="btn-revoke px-2 py-0.5 text-[11px] font-semibold rounded text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition">
+            解除
+          </button>
+        `;
+        row.querySelector('.btn-revoke').addEventListener('click', async () => {
+          if (confirm(`${email} の利用許可を解除しますか？`)) {
+            await revokeUser(email);
+            await refreshAdminData();
+          }
+        });
+        dom.adminWhitelistList.appendChild(row);
+      });
+    }
+  } catch (err) {
+    console.warn('Error fetching whitelist:', err);
+  }
+}
+
+// ユーザー承認処理
+async function approveUser(email) {
+  if (!db || !email) return;
+  const cleanEmail = email.toLowerCase().trim();
+  try {
+    await db.collection('whitelist').doc(cleanEmail).set({
+      allowed: true,
+      approvedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    // 申請から削除
+    await db.collection('join_requests').doc(cleanEmail).delete();
+  } catch (err) {
+    alert(`承認に失敗しました: ${err.message}`);
+  }
+}
+
+// ユーザー許可解除
+async function revokeUser(email) {
+  if (!db || !email) return;
+  const cleanEmail = email.toLowerCase().trim();
+  try {
+    await db.collection('whitelist').doc(cleanEmail).delete();
+  } catch (err) {
+    alert(`解除に失敗しました: ${err.message}`);
+  }
+}
+
+// 手動でメールアドレスを追加
+async function handleAddWhitelist() {
+  const email = (dom.inputNewWhitelistEmail.value || '').toLowerCase().trim();
+  if (!email || !email.includes('@')) {
+    alert('有効なメールアドレスを入力してください。');
+    return;
+  }
+  await approveUser(email);
+  dom.inputNewWhitelistEmail.value = '';
+  await refreshAdminData();
+  alert(`${email} を許可リストに追加しました。`);
+}
+
+// ==================== 問題データ読み込み ====================
+async function loadQuestionsData() {
+  try {
+    const res = await fetch('./data/questions.json');
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    allQuestions = await res.json();
+  } catch (err) {
+    console.error('Failed to load questions:', err);
+  }
+}
+
+// ==================== テーマ（ダークモード） ====================
 function setupTheme() {
   const saved = localStorage.getItem(STORAGE_KEY_THEME);
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -171,8 +511,28 @@ function toggleTheme() {
     : 'ph-bold ph-moon text-xl text-slate-600';
 }
 
-// イベントリスナー設定
+// ==================== イベントリスナー ====================
 function setupEventListeners() {
+  // Auth
+  dom.btnGoogleLogin.addEventListener('click', handleGoogleLogin);
+  dom.btnLogout.addEventListener('click', handleLogout);
+  dom.btnPendingLogout.addEventListener('click', handleLogout);
+  dom.btnPendingRefresh.addEventListener('click', () => {
+    if (currentUser) handleAuthStateChange(currentUser);
+  });
+  dom.btnBypassLogin.addEventListener('click', () => {
+    fallbackToLocalMode('バイパスログイン');
+  });
+
+  // Admin
+  dom.btnAdminPanel.addEventListener('click', openAdminPanel);
+  dom.btnCloseAdminModal.addEventListener('click', closeAdminPanel);
+  dom.modalAdminUsers.addEventListener('click', (e) => {
+    if (e.target === dom.modalAdminUsers) closeAdminPanel();
+  });
+  dom.btnAddWhitelist.addEventListener('click', handleAddWhitelist);
+
+  // Home & Header
   dom.btnHome.addEventListener('click', showHome);
   dom.btnThemeToggle.addEventListener('click', toggleTheme);
   dom.btnResetData.addEventListener('click', handleDataReset);
@@ -237,10 +597,14 @@ function setupEventListeners() {
 
 // 画面切り替え
 function switchView(viewName) {
+  dom.viewAuth.classList.add('hidden');
+  dom.viewPending.classList.add('hidden');
   dom.viewHome.classList.add('hidden');
   dom.viewQuiz.classList.add('hidden');
   dom.viewResult.classList.add('hidden');
 
+  if (viewName === 'auth') dom.viewAuth.classList.remove('hidden');
+  if (viewName === 'pending') dom.viewPending.classList.remove('hidden');
   if (viewName === 'home') dom.viewHome.classList.remove('hidden');
   if (viewName === 'quiz') dom.viewQuiz.classList.remove('hidden');
   if (viewName === 'result') dom.viewResult.classList.remove('hidden');
@@ -249,6 +613,10 @@ function switchView(viewName) {
 }
 
 function showHome() {
+  if (!isApproved) {
+    switchView(currentUser ? 'pending' : 'auth');
+    return;
+  }
   switchView('home');
   updateDashboardStats();
   const activeTab = dom.overviewTabs.querySelector('.bg-sky-600');
@@ -256,7 +624,7 @@ function showHome() {
   renderOverviewGrid(yr);
 }
 
-// ダッシュボード統計更新
+// ダッシュボード統計
 function updateDashboardStats() {
   const answeredKeys = Object.keys(userAnswers);
   const totalSolved = answeredKeys.length;
@@ -334,7 +702,7 @@ function startYearMode(year) {
 
 // 2. ランダム出題モード
 function startRandomMode(yearFilter, count) {
-  let pool = allQuestions.filter(q => !q.is_cancelled); // 採点対象外は除外
+  let pool = allQuestions.filter(q => !q.is_cancelled);
   if (yearFilter !== 'all') {
     const yr = parseInt(yearFilter, 10);
     pool = pool.filter(q => q.year === yr);
@@ -342,7 +710,6 @@ function startRandomMode(yearFilter, count) {
 
   if (pool.length === 0) return alert('出題対象の問題がありません。');
 
-  // シャッフル
   const shuffled = [...pool].sort(() => 0.5 - Math.random());
   const selected = shuffled.slice(0, Math.min(count, shuffled.length));
 
@@ -404,7 +771,6 @@ function startBookmarkReviewMode() {
   startSession();
 }
 
-// 一覧から特定の1問を解く
 function startSingleQuestion(targetQ) {
   const qs = allQuestions.filter(q => q.year === targetQ.year);
   const idx = qs.findIndex(q => q.id === targetQ.id);
@@ -422,7 +788,6 @@ function startSingleQuestion(targetQ) {
   startSession();
 }
 
-// セッション開始
 function startSession() {
   switchView('quiz');
   dom.quizModeBadge.textContent = currentSession.title;
@@ -438,13 +803,11 @@ function renderCurrentQuestion() {
   currentSession.userSelections = [];
   currentSession.isAnswered = false;
 
-  // 進捗更新
   const total = currentSession.questions.length;
   const currentNum = currentSession.currentIndex + 1;
   dom.quizProgressText.textContent = `問 ${currentNum} / ${total}`;
   dom.quizProgressBar.style.width = `${(currentNum / total) * 100}%`;
 
-  // 問題ヘッダー
   dom.qNumberTag.textContent = `${q.year}年 第${q.q_num}問`;
   
   if (q.is_multiple) {
@@ -455,20 +818,15 @@ function renderCurrentQuestion() {
     dom.qSelectBadge.className = 'px-2 py-0.5 rounded text-xs font-bold bg-sky-100 dark:bg-sky-900/50 text-sky-800 dark:text-sky-200';
   }
 
-  // ブックマーク状態
   updateBookmarkButtonUI(bookmarkedIds.has(q.id));
-
-  // 問題本文
   dom.qBody.textContent = q.question;
 
-  // 採点対象外アラート
   if (q.is_cancelled) {
     dom.qCancelledAlert.classList.remove('hidden');
   } else {
     dom.qCancelledAlert.classList.add('hidden');
   }
 
-  // 図・画像
   dom.qImagesContainer.innerHTML = '';
   if (q.images && q.images.length > 0) {
     dom.qImagesContainer.classList.remove('hidden');
@@ -485,7 +843,6 @@ function renderCurrentQuestion() {
     dom.qImagesContainer.classList.add('hidden');
   }
 
-  // 選択肢
   dom.qOptionsContainer.innerHTML = '';
   if (q.options && q.options.length > 0) {
     q.options.forEach(opt => {
@@ -503,12 +860,10 @@ function renderCurrentQuestion() {
     });
   }
 
-  // UI状態初期化
   dom.quizActionBar.classList.remove('hidden');
   dom.btnSubmitAnswer.disabled = true;
   dom.qExplanationCard.classList.add('hidden');
 
-  // ナビゲーションボタン状態
   dom.btnPrevQuestion.disabled = currentSession.currentIndex === 0;
   if (currentSession.currentIndex === total - 1) {
     dom.btnNextQuestion.innerHTML = '<span>結果を見る</span> <i class="ph-bold ph-trophy"></i>';
@@ -516,7 +871,6 @@ function renderCurrentQuestion() {
     dom.btnNextQuestion.innerHTML = '<span>次の問題へ</span> <i class="ph-bold ph-caret-right"></i>';
   }
 
-  // 既に解答済みの履歴があれば表示
   const pastAns = userAnswers[q.id];
   if (pastAns) {
     dom.qStatusBadge.classList.remove('hidden');
@@ -532,19 +886,16 @@ function renderCurrentQuestion() {
   }
 }
 
-// 選択肢クリック時の挙動
 function handleOptionClick(key, cardEl, q) {
-  if (currentSession.isAnswered) return; // 回答後は選択不可
+  if (currentSession.isAnswered) return;
 
   if (q.is_multiple) {
-    // 複数選択
     if (currentSession.userSelections.includes(key)) {
       currentSession.userSelections = currentSession.userSelections.filter(k => k !== key);
       cardEl.classList.remove('option-card-selected');
     } else {
       const limit = q.num_choices || 2;
       if (currentSession.userSelections.length >= limit) {
-        // 先に入っていたものを押し出すか、制限するか
         const removedKey = currentSession.userSelections.shift();
         const prevCard = dom.qOptionsContainer.querySelector(`[data-key="${removedKey}"]`);
         if (prevCard) prevCard.classList.remove('option-card-selected');
@@ -553,7 +904,6 @@ function handleOptionClick(key, cardEl, q) {
       cardEl.classList.add('option-card-selected');
     }
   } else {
-    // 単一選択
     currentSession.userSelections = [key];
     dom.qOptionsContainer.querySelectorAll('.option-card').forEach(el => {
       el.classList.remove('option-card-selected');
@@ -561,12 +911,10 @@ function handleOptionClick(key, cardEl, q) {
     cardEl.classList.add('option-card-selected');
   }
 
-  // 送信ボタンの活性化判定
   const requiredCount = q.is_multiple ? (q.num_choices || 2) : 1;
   dom.btnSubmitAnswer.disabled = currentSession.userSelections.length !== requiredCount;
 }
 
-// 回答の確定
 function submitCurrentAnswer() {
   const q = currentSession.questions[currentSession.currentIndex];
   if (!q) return;
@@ -574,12 +922,11 @@ function submitCurrentAnswer() {
   currentSession.isAnswered = true;
   dom.quizActionBar.classList.add('hidden');
 
-  // 正誤判定
   const selectedSorted = [...currentSession.userSelections].sort().join(',');
   const correctSorted = [...q.correct_keys].sort().join(',');
   const isCorrect = (selectedSorted === correctSorted) || q.is_cancelled;
 
-  // 履歴に保存
+  // 解答データの保存（クラウド＋ローカル）
   userAnswers[q.id] = {
     selectedKeys: currentSession.userSelections,
     isCorrect: isCorrect,
@@ -592,7 +939,6 @@ function submitCurrentAnswer() {
     isCorrect: isCorrect
   });
 
-  // 選択肢の色分け
   dom.qOptionsContainer.querySelectorAll('.option-card').forEach(card => {
     const key = card.dataset.key;
     const isSelected = currentSession.userSelections.includes(key);
@@ -606,7 +952,6 @@ function submitCurrentAnswer() {
     }
   });
 
-  // バナーと解説の表示
   if (isCorrect) {
     dom.bannerResult.className = 'p-4 rounded-xl flex items-center justify-between text-white font-bold bg-emerald-600 shadow-md shadow-emerald-600/20';
     dom.bannerIcon.className = 'ph-bold ph-check-circle text-2xl';
@@ -621,11 +966,9 @@ function submitCurrentAnswer() {
   dom.qExplanationBody.textContent = q.explanation || '解説は準備中です。';
   dom.qExplanationCard.classList.remove('hidden');
 
-  // 解説までスムーズスクロール
   dom.qExplanationCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-// 前の問題へ
 function goToPrevQuestion() {
   if (currentSession.currentIndex > 0) {
     currentSession.currentIndex--;
@@ -634,7 +977,6 @@ function goToPrevQuestion() {
   }
 }
 
-// 次の問題へ / 結果画面
 function goToNextQuestion() {
   if (currentSession.currentIndex < currentSession.questions.length - 1) {
     currentSession.currentIndex++;
@@ -645,7 +987,6 @@ function goToNextQuestion() {
   }
 }
 
-// ブックマーク切り替え
 function toggleCurrentBookmark() {
   const q = currentSession.questions[currentSession.currentIndex];
   if (!q) return;
@@ -677,12 +1018,10 @@ function confirmExitQuiz() {
 }
 
 // ==================== 結果画面 ====================
-
 function showResults() {
   switchView('result');
 
   const total = currentSession.questions.length;
-  // 今回のセッションで正解した数を集計
   let correctCount = 0;
   currentSession.questions.forEach(q => {
     if (userAnswers[q.id] && userAnswers[q.id].isCorrect) {
@@ -714,7 +1053,6 @@ function showResults() {
 }
 
 // ==================== ドロワー & モーダル ====================
-
 function openDrawer() {
   dom.drawerGrid.innerHTML = '';
   currentSession.questions.forEach((q, idx) => {
@@ -766,12 +1104,17 @@ function closeImageViewer() {
 }
 
 // データの初期化
-function handleDataReset() {
+async function handleDataReset() {
   if (confirm('これまでの解答履歴やチェックをすべて初期化しますか？\n（この操作は取り消せません）')) {
     localStorage.removeItem(STORAGE_KEY_ANSWERS);
     localStorage.removeItem(STORAGE_KEY_BOOKMARKS);
     userAnswers = {};
     bookmarkedIds = new Set();
+
+    if (isApproved && currentUser && isFirebaseConfigured) {
+      await saveUserDataToCloud();
+    }
+
     updateDashboardStats();
     renderOverviewGrid(2025);
     alert('学習データを初期化しました。');
